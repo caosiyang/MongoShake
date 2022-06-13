@@ -3,14 +3,16 @@ package docsyncer
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
+
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"sync/atomic"
+
+	"sync"
 
 	conf "github.com/alibaba/MongoShake/v2/collector/configure"
 	utils "github.com/alibaba/MongoShake/v2/common"
-	"sync"
 
 	LOG "github.com/vinllen/log4go"
 )
@@ -75,6 +77,7 @@ func (colExecutor *CollectionExecutor) Start() error {
 	parallel := conf.Options.FullSyncReaderWriteDocumentParallel
 	colExecutor.docBatch = make(chan []*bson.Raw, parallel)
 
+	// 创建N个工作任务（DocExecutor），向目标端的目标集合（并发）写入数据
 	executors := make([]*DocExecutor, parallel)
 	for i := 0; i != len(executors); i++ {
 		// Client is a handle representing a pool of connections, can be use by multi routines
@@ -160,12 +163,14 @@ func (exec *DocExecutor) start() {
 	}
 
 	for {
+		// 获取一批文档
 		docs, ok := <-exec.colExecutor.docBatch
 		if !ok {
 			break
 		}
 
 		if exec.error == nil {
+			// 写入目标端
 			if err := exec.doSync(docs); err != nil {
 				exec.error = err
 				// since v2.4.11: panic directly if meets error
@@ -178,6 +183,7 @@ func (exec *DocExecutor) start() {
 	}
 }
 
+// TODO 核心函数，需要进一步分析
 // use by full sync
 func (exec *DocExecutor) doSync(docs []*bson.Raw) error {
 	if len(docs) == 0 || conf.Options.FullSyncExecutorDebug {

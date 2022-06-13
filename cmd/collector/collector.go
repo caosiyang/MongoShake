@@ -1,3 +1,4 @@
+//go:build darwin || linux || windows
 // +build darwin linux windows
 
 package main
@@ -5,10 +6,11 @@ package main
 import (
 	"flag"
 	"fmt"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"os"
 	"strconv"
 	"syscall"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	conf "github.com/alibaba/MongoShake/v2/collector/configure"
 	"github.com/alibaba/MongoShake/v2/collector/coordinator"
@@ -139,6 +141,7 @@ func startup() {
 		}
 	}
 
+	// 开始同步数据
 	// start mongodb replication
 	if err := coordinator.Run(); err != nil {
 		// initial or connection established failed

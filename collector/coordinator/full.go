@@ -11,8 +11,8 @@ import (
 	"github.com/alibaba/MongoShake/v2/collector/transform"
 	utils "github.com/alibaba/MongoShake/v2/common"
 	"github.com/alibaba/MongoShake/v2/sharding"
+	nimo "github.com/gugemichael/nimo4go"
 
-	"github.com/gugemichael/nimo4go"
 	LOG "github.com/vinllen/log4go"
 	"go.mongodb.org/mongo-driver/bson"
 )
@@ -60,10 +60,12 @@ func getTimestampMap(sources []*utils.MongoSource, sslRootFile string) (map[stri
 
 func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 
+	// 根据用户配置，判断源端是否为分片集群
 	fromIsSharding := coordinator.SourceIsSharding()
 
 	var shardingChunkMap sharding.ShardingChunkMap
 	var err error
+	// 如果直接从分片同步数据（未指定mongos和change_stream模式），需要获取chunk分布信息
 	// init orphan sharding chunk map if source is mongod(get data directly from mongod)
 	if fromIsSharding && coordinator.MongoS == nil {
 		LOG.Info("source is mongod, need to fetching chunk map")
@@ -76,7 +78,9 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 		LOG.Info("source is replica or mongos, no need to fetching chunk map")
 	}
 
+	// 加载namespace白名单或黑名单（二者仅支持配置其一）
 	filterList := filter.NewDocFilterList()
+	// 获取待同步的全部namespace
 	// get all namespace need to sync
 	nsSet, _, err := utils.GetAllNamespace(coordinator.RealSourceFullSync, filterList.IterateFilter,
 		conf.Options.MongoSslRootCaFile)
@@ -94,6 +98,7 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 		}
 	}
 
+	// 与目标端建立连接
 	// create target client
 	toUrl := conf.Options.TunnelAddress[0]
 	var toConn *utils.MongoCommunityConn
@@ -105,14 +110,18 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 		defer toConn.Close()
 	}
 
+	// namespace转换
 	// create namespace transform
 	trans := transform.NewNamespaceTransform(conf.Options.TransformNamespace)
 
+	// 检查目标集合是否存在，根据full_sync.collection_exist_drop配置，决定是否删除目标集合
+	// 建议full_sync.collection_exist_drop = false，如果目标端配置错误，可能误删数据；人工删除集合，确保目标端的环境纯净
 	// drop target collection if possible
 	if err := docsyncer.StartDropDestCollection(nsSet, toConn, trans); err != nil {
 		return err
 	}
 
+	// 如果源端和目标端都是分片集群，为目标端数据库和集合配置sharding
 	// enable shard if sharding -> sharding
 	shardingSync := docsyncer.IsShardingToSharding(fromIsSharding, toConn)
 	if shardingSync {
@@ -142,6 +151,7 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 		}
 		LOG.Info("index list above: ----------")
 
+		// 如果配置后台索引，在全量数据同步开始前进行创建
 		if conf.Options.FullSyncCreateIndex == utils.VarFullSyncCreateIndexBackground {
 			if err := docsyncer.StartIndexSync(indexMap, toUrl, trans, true); err != nil {
 				return fmt.Errorf("create background index failed[%v]", err)
@@ -155,6 +165,8 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 	// start sync each db
 	var wg sync.WaitGroup
 	var replError error
+	// 如果指定mongo_s_url和change_stream模式，仅启动一个任务
+	// 如果mongo_urls指定多个URI，则对应地启动多个任务
 	for i, src := range coordinator.RealSourceFullSync {
 		var orphanFilter *filter.OrphanFilter
 		if conf.Options.FullSyncExecutorFilterOrphanDocument && shardingChunkMap != nil {
@@ -167,6 +179,7 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 			orphanFilter = filter.NewOrphanFilter(src.ReplicaName, dbChunkMap)
 		}
 
+		// 创建&初始化DBSyner
 		dbSyncer := docsyncer.NewDBSyncer(i, src.URL, src.ReplicaName, toUrl, trans, orphanFilter, qos, fromIsSharding)
 		dbSyncer.Init()
 		LOG.Info("document syncer-%d do replication for url=%v", i, src.URL)
@@ -174,6 +187,7 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 		wg.Add(1)
 		nimo.GoRoutine(func() {
 			defer wg.Done()
+			// 启动DBSyner
 			if err := dbSyncer.Start(); err != nil {
 				LOG.Critical("document replication for url=%v failed. %v",
 					utils.BlockMongoUrlPassword(src.URL, "***"), err)
@@ -198,6 +212,7 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 		return replError
 	}
 
+	// 如果配置前台索引，在全量数据同步完成后进行创建
 	// create index if == foreground
 	if conf.Options.FullSyncCreateIndex == utils.VarFullSyncCreateIndexForeground {
 		if err := docsyncer.StartIndexSync(indexMap, toUrl, trans, false); err != nil {
@@ -234,6 +249,9 @@ func (coordinator *ReplicationCoordinator) startDocumentReplication() error {
 }
 
 func (coordinator *ReplicationCoordinator) SourceIsSharding() bool {
+	// 两种方式判断源端是否为分片集群
+	// 1. 指定了mongo_s_url，同时incr_sync.mongo_fetch_method = change_stream
+	// 2. mongo_urls指定了多个URI，即每个分片的URI
 	if conf.Options.IncrSyncMongoFetchMethod == utils.VarIncrSyncMongoFetchMethodChangeStream {
 		return coordinator.MongoS != nil
 	} else {

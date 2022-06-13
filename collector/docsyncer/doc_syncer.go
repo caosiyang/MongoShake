@@ -3,11 +3,12 @@ package docsyncer
 import (
 	"errors"
 	"fmt"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 
 	"github.com/alibaba/MongoShake/v2/collector/ckpt"
 	conf "github.com/alibaba/MongoShake/v2/collector/configure"
@@ -382,17 +383,21 @@ func (syncer *DBSyncer) Start() (syncError error) {
 		syncer.metricNsMap[ns] = NewCollectionMetric()
 	}
 
+	// 创建chan，size是集合同步并发数
+	// 这里可以优化，统计集合数据量，将数据量大的集合优先写入chan
 	collExecutorParallel := conf.Options.FullSyncReaderCollectionParallel
 	namespaces := make(chan utils.NS, collExecutorParallel)
 
 	wg.Add(len(nsList))
 
+	// 新建一个任务，往chan写入待同步的集合
 	nimo.GoRoutine(func() {
 		for _, ns := range nsList {
 			namespaces <- ns
 		}
 	})
 
+	// 创建N个任务（即full_sync.reader.collection_parallel）并发同步数据，每个任务同步一个集合
 	// run collection sync in parallel
 	var nsDoneCount int32 = 0
 	for i := 0; i < collExecutorParallel; i++ {
@@ -407,6 +412,7 @@ func (syncer *DBSyncer) Start() (syncError error) {
 				toNS := utils.NewNS(syncer.nsTrans.Transform(ns.Str()))
 
 				LOG.Info("%s collExecutor-%d sync ns %v to %v begin", syncer, collExecutorId, ns, toNS)
+				// 开始同步集合数据
 				err := syncer.collectionSync(collExecutorId, ns, toNS)
 				atomic.AddInt32(&nsDoneCount, 1)
 
@@ -435,10 +441,13 @@ func (syncer *DBSyncer) Start() (syncError error) {
 func (syncer *DBSyncer) collectionSync(collExecutorId int, ns utils.NS, toNS utils.NS) error {
 	// writer
 	colExecutor := NewCollectionExecutor(collExecutorId, syncer.ToMongoUrl, toNS, syncer, conf.Options.TunnelMongoSslRootCaFile)
+	// 启动CollectoinExecutor，往目标端写数据
 	if err := colExecutor.Start(); err != nil {
 		return fmt.Errorf("start collectionSync failed: %v", err)
 	}
 
+	// 根据用户配置（full_sync.reader.parallel_thread），决定是否对集合数据切片，生成对应的reader
+	// TODO 此处需要进一步分析
 	// splitter reader
 	splitter := NewDocumentSplitter(syncer.FromMongoUrl, conf.Options.MongoSslRootCaFile, ns)
 	if splitter == nil {
@@ -455,14 +464,17 @@ func (syncer *DBSyncer) collectionSync(collExecutorId int, ns utils.NS, toNS uti
 	var wg sync.WaitGroup
 	wg.Add(conf.Options.FullSyncReaderParallelThread)
 	for i := 0; i < conf.Options.FullSyncReaderParallelThread; i++ {
+		// 创建工作任务，从源端读数据
 		go func() {
 			defer wg.Done()
 			for {
+				// 获取此前创建的reader
 				reader, ok := <-splitter.readerChan
 				if !ok || reader == nil {
 					break
 				}
 
+				// 开始读取集合数据
 				if err := syncer.splitSync(reader, colExecutor, collectionMetric); err != nil {
 					LOG.Crashf("%v", err)
 				}
@@ -491,16 +503,19 @@ func (syncer *DBSyncer) collectionSync(collExecutorId int, ns utils.NS, toNS uti
 }
 
 func (syncer *DBSyncer) splitSync(reader *DocumentReader, colExecutor *CollectionExecutor, collectionMetric *CollectionMetric) error {
+	// 创建chan，size是full_sync.reader.document_batch_size
 	bufferSize := conf.Options.FullSyncReaderDocumentBatchSize
 	buffer := make([]*bson.Raw, 0, bufferSize)
 	bufferByteSize := 0
 
 	for {
+		// 读取一条文档
 		doc, err := reader.NextDoc()
 		// doc, err := reader.NextDocMgo()
 		if err != nil {
 			return fmt.Errorf("splitter reader[%v] get next document failed: %v", reader, err)
 		} else if doc == nil {
+			// 集群数据读取完毕，将buffer中的文档转移至docBatch，准备写入目标端
 			atomic.AddUint64(&collectionMetric.FinishCount, uint64(len(buffer)))
 			colExecutor.Sync(buffer)
 			syncer.replMetric.AddSuccess(uint64(len(buffer))) // only used to calculate the tps which is extract from "success"
@@ -509,6 +524,8 @@ func (syncer *DBSyncer) splitSync(reader *DocumentReader, colExecutor *Collectio
 
 		syncer.replMetric.AddGet(1)
 
+		// 如果buffer中的文档数量大于等于document_batch_size 或 文档数据量大于12MB
+		// 将buffer中的文档转移至docBatch，准备写入目标端
 		if bufferByteSize+len(doc) > MAX_BUFFER_BYTE_SIZE || len(buffer) >= bufferSize {
 			atomic.AddUint64(&collectionMetric.FinishCount, uint64(len(buffer)))
 			colExecutor.Sync(buffer)

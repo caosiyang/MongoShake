@@ -77,8 +77,10 @@ func (coordinator *ReplicationCoordinator) Run() error {
 	}
 	LOG.Info("start running with mode[%v], fullBeginTs[%v]", syncMode, fullBegin)
 
+	// 根据配置的同步模式，进行数据同步
 	switch syncMode {
 	case utils.VarSyncModeAll:
+		// 全量+增量数据同步
 		if conf.Options.FullSyncReaderOplogStoreDisk {
 			LOG.Info("run parallel document oplog")
 			if err := coordinator.parallelDocumentOplog(fullBeginTs); err != nil {
@@ -91,10 +93,12 @@ func (coordinator *ReplicationCoordinator) Run() error {
 			}
 		}
 	case utils.VarSyncModeFull:
+		// 仅全量数据同步
 		if err := coordinator.startDocumentReplication(); err != nil {
 			return err
 		}
 	case utils.VarSyncModeIncr:
+		// 仅增量数据同步
 		if err := coordinator.startOplogReplication(int64(0), int64(0), startTsMap); err != nil {
 			return err
 		}

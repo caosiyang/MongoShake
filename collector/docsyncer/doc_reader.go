@@ -3,10 +3,11 @@ package docsyncer
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
+
 	conf "github.com/alibaba/MongoShake/v2/collector/configure"
 	utils "github.com/alibaba/MongoShake/v2/common"
 	"go.mongodb.org/mongo-driver/bson"
-	"sync/atomic"
 
 	LOG "github.com/vinllen/log4go"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -95,9 +96,11 @@ func (ds *DocumentSplitter) Run() error {
 	// close channel
 	defer close(ds.readerChan)
 
+	// full_sync.reader.parallel_thread <= 1，不开启集合数据切片
 	// disable split
 	if conf.Options.FullSyncReaderParallelThread <= 1 {
 		LOG.Info("splitter[%s] disable split or no need", ds)
+		// 创建DocuemntReader，写入chan，后面工作任务会获取该reader
 		ds.readerChan <- NewDocumentReader(0, ds.src, ds.ns, "", nil, nil, ds.sslRootCaFile)
 		LOG.Info("splitter[%s] exits", ds)
 		return nil
@@ -206,6 +209,7 @@ type DocumentReader struct {
 
 // NewDocumentReader creates reader with mongodb url
 func NewDocumentReader(id int, src string, ns utils.NS, key string, start, end interface{}, sslRootCaFile string) *DocumentReader {
+	// 默认query是{}
 	q := make(bson.M)
 	if start != nil || end != nil {
 		innerQ := make(bson.M)
